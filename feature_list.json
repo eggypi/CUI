@@ -1,0 +1,184 @@
+{
+  "project": {
+    "name": "Claude Code UI",
+    "description": "面向银行业务同事的 Claude Code 图形化界面，避免终端界面吓到非研发用户",
+    "tech_stack": ["Electron", "React", "Vite", "TypeScript", "Tailwind CSS", "mammoth.js", "diff2html", "react-markdown", "rehype-highlight"]
+  },
+  "features": [
+    {
+      "id": "feat-001",
+      "title": "项目脚手架初始化",
+      "description": "Electron + React + Vite + TypeScript 项目结构，主进程（main.ts）、预加载脚本（preload.ts）、渲染进程入口，package.json 依赖配置，electron-builder 打包配置",
+      "depends_on": [],
+      "acceptance_criteria": [
+        "项目目录结构完整：src/main/main.ts, src/preload/preload.ts, src/renderer/main.tsx, src/renderer/App.tsx",
+        "package.json 包含所有必要依赖：electron, react, vite, typescript, tailwindcss, mammoth, diff2html, react-markdown, rehype-highlight",
+        "vite.config.ts 正确配置 React 插件",
+        "electron-builder 配置文件存在",
+        "tsconfig.json 正确配置",
+        "npm install 成功无报错",
+        "npm run dev 能启动 Vite 开发服务器（渲染进程）",
+        "Tailwind CSS 配置完成，能在 React 组件中使用 Tailwind 类名"
+      ]
+    },
+    {
+      "id": "feat-002",
+      "title": "主界面三栏布局 + 暗色主题",
+      "description": "左侧栏：会话列表 + 新建任务按钮；中间：聊天区域 + 底部输入框；右侧栏：文件修改 + 文档预览区；Cowork 风格暗色主题（深灰背景、圆角卡片）",
+      "depends_on": ["feat-001"],
+      "acceptance_criteria": [
+        "三栏布局正确渲染：左侧栏（宽度约 240px 可调）、中间聊天区（自适应）、右侧栏（宽度约 320px 可调）",
+        "左侧栏包含「新建任务」按钮和会话列表占位区域",
+        "中间区域包含聊天消息滚动区和底部输入框",
+        "右侧栏包含文件修改和文档预览的 Tab 切换",
+        "暗色主题：背景色 #1a1a2e 或类似深色，文字 #e0e0e0，卡片背景 #252540，圆角 8px+",
+        "响应式布局不溢出",
+        "输入框支持多行文本输入（Shift+Enter 换行，Enter 发送）"
+      ]
+    },
+    {
+      "id": "feat-003",
+      "title": "初始配置引导页",
+      "description": "首次启动检测（检查 ~/.claude/settings.json 是否有 ANTHROPIC_BASE_URL），配置表单：Base URL、Model Name、API Key，写入 ~/.claude/settings.json（env 字段）和 ~/.claude/.claude.json，配置完成后进入主界面，支持后续修改配置（设置入口）",
+      "depends_on": ["feat-002"],
+      "acceptance_criteria": [
+        "首次启动时自动检测 ~/.claude/settings.json 是否存在且包含 ANTHROPIC_BASE_URL",
+        "若未配置，显示全屏引导页面（非弹窗），包含 Base URL、Model Name、API Key 三个输入字段",
+        "表单有基本验证：Base URL 必须是有效 URL，API Key 不能为空",
+        "提交后正确写入 ~/.claude/settings.json 的 env 字段（ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, ANTHROPIC_API_KEY）",
+        "同时写入 ~/.claude/.claude.json 中的 model 字段",
+        "配置成功后自动跳转到主界面",
+        "主界面有设置按钮可重新打开配置页面修改设置",
+        "修改配置后保存成功"
+      ]
+    },
+    {
+      "id": "feat-004",
+      "title": "工作文件夹选择器",
+      "description": "底部输入框旁的文件夹选择下拉，Electron dialog.showOpenDialog 选择文件夹，记住最近使用的 5 个文件夹，切换文件夹时重启 Claude Code 进程",
+      "depends_on": ["feat-002"],
+      "acceptance_criteria": [
+        "输入框左侧有文件夹选择按钮/下拉",
+        "点击按钮弹出系统文件夹选择对话框（Electron dialog.showOpenDialog）",
+        "选择后显示当前工作文件夹路径（缩短显示，如 ~/projects/my-app）",
+        "最近使用的文件夹列表（最多 5 个）持久化存储到 localStorage 或文件",
+        "下拉列表中显示最近使用的文件夹，点击快速切换",
+        "切换文件夹时触发事件通知进程管理模块（供 feat-005 使用）",
+        "没有选择文件夹时显示提示文案"
+      ]
+    },
+    {
+      "id": "feat-005",
+      "title": "Claude Code 进程管理与聊天核心",
+      "description": "child_process.spawn 启动 claude CLI，解析 NDJSON stream-json 事件流，通过 stdin 发送用户消息，聊天消息渲染（Markdown + 代码高亮），流式文本实时输出，工具调用的折叠展示（Bash 命令、文件操作等），进程生命周期管理（启动、停止、重启）",
+      "depends_on": ["feat-002"],
+      "acceptance_criteria": [
+        "能通过 child_process.spawn 启动 claude --print --output-format stream-json --input-format stream-json 进程",
+        "正确解析 NDJSON 行（每行一个 JSON 对象）：init, message_start, content_block_start, content_block_delta, content_block_stop, message_delta, result 等事件",
+        "用户消息通过 stdin 以 JSON 格式发送：{type: 'user_message', message: {role: 'user', content: text}}",
+        "聊天区域正确渲染 Markdown 内容（标题、列表、代码块、链接等）",
+        "代码块有语法高亮",
+        "流式输出实时显示（打字机效果），无明显延迟",
+        "工具调用（tool_use）显示为可折叠的卡片，展示工具名和参数",
+        "tool_result 内容在折叠区内显示",
+        "进程启动、停止、重启功能正常",
+        "进程异常退出时有错误提示和重启选项",
+        "自动滚动到最新消息"
+      ]
+    },
+    {
+      "id": "feat-006",
+      "title": "权限请求 UI",
+      "description": "拦截 permission/control_request 事件，弹出审批对话框（允许/拒绝），发送 control_response 回 claude stdin，显示请求详情（工具名、命令内容等）",
+      "depends_on": ["feat-005"],
+      "acceptance_criteria": [
+        "能正确识别 stream-json 中的权限请求事件（tool_use 需要审批时的 control 事件）",
+        "弹出模态对话框显示权限请求详情：工具名、命令/操作内容、文件路径等",
+        "对话框有「允许」和「拒绝」两个按钮",
+        "点击允许后通过 stdin 发送正确的 control_response（allow）",
+        "点击拒绝后通过 stdin 发送正确的 control_response（deny）",
+        "对话框风格与暗色主题一致",
+        "多个权限请求能排队处理"
+      ]
+    },
+    {
+      "id": "feat-007",
+      "title": "Skill 选择器",
+      "description": "底部输入框的 '+' 按钮 → 弹出 Skill 列表，输入框内输入 '/' 触发 Skill 搜索，从 claude CLI 获取可用 skills 列表，点击选择后插入到输入框",
+      "depends_on": ["feat-005"],
+      "acceptance_criteria": [
+        "输入框右侧有 '+' 按钮",
+        "点击 '+' 按钮弹出 Skill 列表弹窗",
+        "列表展示可用 skill 的名称和简短描述",
+        "在输入框中输入 '/' 时自动弹出 Skill 搜索面板",
+        "搜索面板支持模糊匹配过滤 skill 列表",
+        "点击 skill 后将 '/skill-name' 插入到输入框",
+        "skill 列表从 claude CLI 动态获取（通过 claude skills --output-format json 或类似命令）",
+        "列表为空时显示提示文案"
+      ]
+    },
+    {
+      "id": "feat-008",
+      "title": "Plan/Accept 模式切换",
+      "description": "输入框区域的模式切换按钮/下拉，支持 plan 和 acceptEdits 两种模式，切换时重启 claude 进程（新 --permission-mode），当前模式状态指示器",
+      "depends_on": ["feat-005"],
+      "acceptance_criteria": [
+        "输入框区域有模式切换 UI（下拉或切换按钮）",
+        "显示两种模式：Plan 模式 和 Accept Edits 模式",
+        "当前激活模式有明显视觉指示（颜色、图标等）",
+        "切换模式时正确停止当前 claude 进程并以新的 --permission-mode 重启",
+        "Plan 模式对应 plan permission mode",
+        "Accept Edits 模式对应 acceptEdits permission mode",
+        "模式切换时聊天区域有提示信息"
+      ]
+    },
+    {
+      "id": "feat-009",
+      "title": "文件修改查看器",
+      "description": "右侧栏展示 Claude 修改的文件列表，从 stream-json 事件中提取 Edit/Write 工具调用，Diff 对比视图（修改前/后），点击文件名展开详细修改内容",
+      "depends_on": ["feat-005"],
+      "acceptance_criteria": [
+        "右侧栏「文件修改」Tab 展示被修改文件的列表",
+        "从 stream-json 事件流中正确提取 Edit 和 Write 工具调用",
+        "文件列表显示文件名和修改类型（编辑/新建/写入）",
+        "点击文件展开显示 Diff 对比视图",
+        "Diff 视图使用 diff2html 渲染，支持并排(side-by-side)或行内(inline)模式",
+        "Diff 视图配色与暗色主题一致",
+        "每次新的工具调用结果更新文件列表",
+        "无修改时显示空状态提示"
+      ]
+    },
+    {
+      "id": "feat-010",
+      "title": "Word 文档内嵌预览",
+      "description": "右侧栏文件浏览面板，列出工作目录下的 .docx 文件，mammoth.js 转 HTML 内嵌预览，基本格式保留（标题、段落、表格、列表）",
+      "depends_on": ["feat-002"],
+      "acceptance_criteria": [
+        "右侧栏「文档预览」Tab 包含文件浏览器",
+        "自动扫描当前工作目录下的 .docx 文件并列出",
+        "点击 .docx 文件后使用 mammoth.js 转换为 HTML 预览",
+        "预览保留基本格式：标题层级、段落、表格、有序/无序列表",
+        "预览区域可滚动浏览长文档",
+        "预览样式与暗色主题一致",
+        "转换失败时显示错误提示",
+        "当前无工作目录时显示提示信息"
+      ]
+    },
+    {
+      "id": "feat-011",
+      "title": "会话历史管理",
+      "description": "左侧栏展示最近会话列表，点击恢复历史会话（claude --resume），「新建任务」按钮开启新会话，会话标题自动生成",
+      "depends_on": ["feat-002", "feat-005"],
+      "acceptance_criteria": [
+        "左侧栏展示最近会话列表（从 claude sessions --output-format json 获取）",
+        "每个会话显示标题和时间",
+        "会话标题从第一条用户消息自动截取生成",
+        "点击历史会话使用 claude --resume <session-id> 恢复会话",
+        "恢复后聊天区域显示历史消息",
+        "「新建任务」按钮创建全新会话（启动新 claude 进程）",
+        "当前激活会话有高亮指示",
+        "会话列表按时间倒序排列"
+      ]
+    }
+  ]
+}

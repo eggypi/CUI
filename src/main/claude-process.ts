@@ -18,40 +18,42 @@ class ClaudeProcessManager extends EventEmitter {
   }
 
   setWorkingFolder(folder: string) {
+    // 切换文件夹时重启进程
+    const changed = this.workingFolder !== folder
     this.workingFolder = folder
+    if (changed) {
+      this.restartProcess()
+    }
   }
 
   setPermissionMode(mode: 'plan' | 'acceptEdits') {
+    const changed = this.permissionMode !== mode
     this.permissionMode = mode
+    if (changed) {
+      this.restartProcess()
+    }
   }
 
   /**
-   * --print 模式：每条消息 = 一次 claude 进程调用
-   * 消息作为命令行参数传入，进程处理完自动退出
-   * 续对话通过 --resume <session-id>
+   * 长连接模式：启动一次 claude 进程，保持 stdin 打开
+   * 通过 stdin 发送 stream-json 消息，通过 stdout 接收回复
+   * 这样 plan 模式的权限拦截能正常工作
    */
-  sendMessage(text: string) {
-    if (!this.workingFolder) {
-      this.sendToRenderer('claude:processError', { message: '请先选择工作文件夹' })
-      return
-    }
-
-    // 如果上一次调用还在跑，先杀掉
+  private startProcess() {
+    if (!this.workingFolder) return
     this.stop()
 
     const args = [
       '--print',
       '--verbose',
       '--output-format', 'stream-json',
+      '--input-format', 'stream-json',
       '--permission-mode', this.permissionMode,
     ]
 
     if (this.sessionId) {
       args.push('--resume', this.sessionId)
     }
-
-    // 用户消息作为最后一个参数
-    args.push(text)
 
     const config = getConfig()
     const childEnv = { ...process.env }
@@ -61,10 +63,10 @@ class ClaudeProcessManager extends EventEmitter {
       childEnv.ANTHROPIC_MODEL = config.modelName
     }
 
-    console.log('[ClaudeProcess] Sending message:', text.slice(0, 80))
+    console.log('[ClaudeProcess] Starting long-lived process')
     console.log('[ClaudeProcess] Args:', args.join(' '))
     console.log('[ClaudeProcess] CWD:', this.workingFolder)
-    console.log('[ClaudeProcess] Session:', this.sessionId || '(new)')
+    console.log('[ClaudeProcess] Permission mode:', this.permissionMode)
 
     try {
       this.process = spawn('claude', args, {
@@ -75,9 +77,6 @@ class ClaudeProcessManager extends EventEmitter {
 
       this.buffer = ''
       this.sendToRenderer('claude:processStarted', { pid: this.process.pid })
-
-      // 消息通过命令行参数传入，立即关闭 stdin 避免 claude 等待
-      this.process.stdin?.end()
 
       this.process.stdout?.on('data', (data: Buffer) => {
         const text = data.toString()
@@ -109,7 +108,56 @@ class ClaudeProcessManager extends EventEmitter {
     }
   }
 
-  /** 发送权限审批响应（stdin 仍然打开，可以写入） */
+  private restartProcess() {
+    if (this.workingFolder) {
+      this.startProcess()
+    }
+  }
+
+  /**
+   * 通过 stdin 发送用户消息（stream-json 格式）
+   * 如果进程未启动，先启动
+   */
+  sendMessage(text: string) {
+    if (!this.workingFolder) {
+      this.sendToRenderer('claude:processError', { message: '请先选择工作文件夹' })
+      return
+    }
+
+    // 如果进程不在运行，先启动
+    if (!this.process) {
+      this.startProcess()
+      // 等进程启动后再发消息
+      const waitAndSend = () => {
+        if (this.process?.stdin) {
+          this.writeUserMessage(text)
+        } else {
+          setTimeout(waitAndSend, 100)
+        }
+      }
+      setTimeout(waitAndSend, 500)
+      return
+    }
+
+    this.writeUserMessage(text)
+  }
+
+  private writeUserMessage(text: string) {
+    if (!this.process?.stdin) return
+
+    // stream-json stdin 格式：匹配输出格式结构
+    const message = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text }],
+      },
+    })
+    console.log('[ClaudeProcess] Sending via stdin:', message.slice(0, 100))
+    this.process.stdin.write(message + '\n')
+  }
+
+  /** 发送权限审批响应 */
   sendPermissionResponse(requestId: string, allowed: boolean) {
     if (!this.process?.stdin) return
 
@@ -118,6 +166,7 @@ class ClaudeProcessManager extends EventEmitter {
       id: requestId,
       permission: allowed ? 'allow' : 'deny',
     })
+    console.log('[ClaudeProcess] Sending permission response:', response)
     this.process.stdin.write(response + '\n')
   }
 
@@ -130,8 +179,8 @@ class ClaudeProcessManager extends EventEmitter {
 
   /** 重置会话（新建任务） */
   resetSession() {
-    this.stop()
     this.sessionId = null
+    this.restartProcess()
   }
 
   isRunning(): boolean {
@@ -164,26 +213,25 @@ class ClaudeProcessManager extends EventEmitter {
       this.sessionId = event.session_id
     }
 
-    // --print --verbose 输出格式：每行一个完整 JSON
-    // type: "system" (subtype: "init") - 初始化
-    // type: "assistant" - 包含完整 message.content 数组
-    // type: "result" - 最终结果
     switch (type) {
       case 'system':
         this.sendToRenderer('claude:init', event)
         break
 
-      case 'assistant': {
-        // 完整的 assistant 消息，直接发给渲染进程
+      case 'assistant':
         this.sendToRenderer('claude:assistantMessage', event)
         break
-      }
+
+      case 'user':
+        // 工具执行结果
+        this.sendToRenderer('claude:event', event)
+        break
 
       case 'result':
         this.sendToRenderer('claude:result', event)
         break
 
-      // 也兼容增量 stream 事件（以防将来切换格式）
+      // 兼容增量 stream 事件
       case 'message_start':
         this.sendToRenderer('claude:messageStart', event)
         break

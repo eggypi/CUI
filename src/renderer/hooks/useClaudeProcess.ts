@@ -44,11 +44,13 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
       },
 
       // --print --verbose 模式：收到完整的 assistant 消息
+      // 每个事件包含累积的 content 数组，用 message.id 去重更新
       'claude:assistantMessage': (...args: unknown[]) => {
         const event = args[0] as Record<string, unknown>
         const message = event.message as Record<string, unknown>
         if (!message) return
 
+        const msgId = (message.id as string) || `assistant-${Date.now()}`
         const contentArr = message.content as Array<Record<string, unknown>>
         if (!contentArr || !Array.isArray(contentArr)) return
 
@@ -69,25 +71,80 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
               const input = (block.input as Record<string, unknown>) || {}
               const filePath = (input.file_path as string) || ''
               if (filePath) {
-                setFileModifications(prev => [...prev, {
-                  filePath,
-                  type: toolName === 'edit' ? 'edit' : 'write',
-                  newContent: (input.new_string as string) || (input.content as string) || '',
-                  oldContent: (input.old_string as string) || undefined,
-                  timestamp: Date.now(),
-                }])
+                setFileModifications(prev => {
+                  // 避免重复添加同一文件修改
+                  if (prev.some(m => m.filePath === filePath && m.timestamp > Date.now() - 5000)) return prev
+                  return [...prev, {
+                    filePath,
+                    type: toolName === 'edit' ? 'edit' : 'write',
+                    newContent: (input.new_string as string) || (input.content as string) || '',
+                    oldContent: (input.old_string as string) || undefined,
+                    timestamp: Date.now(),
+                  }]
+                })
               }
             }
           }
+          // 跳过 thinking 块，不展示给用户
         }
 
-        if (chatContent.length > 0) {
-          setMessages(prev => [...prev, {
-            id: `assistant-${Date.now()}`,
-            role: 'assistant',
+        if (chatContent.length === 0) return
+
+        // 用 message ID 去重：更新已有消息或追加新消息
+        setMessages(prev => {
+          const existingIdx = prev.findIndex(m => m.id === msgId)
+          if (existingIdx >= 0) {
+            const updated = [...prev]
+            updated[existingIdx] = { ...updated[existingIdx], content: chatContent }
+            return updated
+          }
+          return [...prev, {
+            id: msgId,
+            role: 'assistant' as const,
             content: chatContent,
             timestamp: Date.now(),
-          }])
+          }]
+        })
+      },
+
+      // 工具执行结果（user 类型事件中的 tool_result）
+      'claude:event': (...args: unknown[]) => {
+        const event = args[0] as Record<string, unknown>
+        const type = event.type as string
+        if (type === 'user') {
+          const message = event.message as Record<string, unknown>
+          if (!message) return
+          const contentArr = message.content as Array<Record<string, unknown>>
+          if (!contentArr || !Array.isArray(contentArr)) return
+
+          for (const block of contentArr) {
+            if (block.type === 'tool_result') {
+              const toolUseId = block.tool_use_id as string
+              const content = block.content as string || ''
+              const isError = block.is_error as boolean || false
+
+              // 把工具结果追加到对应的 assistant 消息里
+              setMessages(prev => {
+                // 找到包含这个 tool_use_id 的 assistant 消息
+                const msgIdx = prev.findIndex(m =>
+                  m.role === 'assistant' && m.content.some(c => c.type === 'tool_use' && c.id === toolUseId)
+                )
+                if (msgIdx >= 0) {
+                  const updated = [...prev]
+                  const msg = { ...updated[msgIdx] }
+                  msg.content = [...msg.content, {
+                    type: 'tool_result' as const,
+                    tool_use_id: toolUseId,
+                    content: content.slice(0, 2000), // 截断过长输出
+                    is_error: isError,
+                  }]
+                  updated[msgIdx] = msg
+                  return updated
+                }
+                return prev
+              })
+            }
+          }
         }
       },
 
@@ -194,23 +251,20 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
 
       'claude:processStarted': () => {
         setIsRunning(true)
-        setMessages(prev => [...prev, {
-          id: `sys-started-${Date.now()}`,
-          role: 'system',
-          content: [{ type: 'text', text: 'Claude 进程已启动' }],
-          timestamp: Date.now(),
-        }])
       },
 
       'claude:stderr': (...args: unknown[]) => {
         const text = String(args[0] || '').trim()
         if (!text) return
-        setMessages(prev => [...prev, {
-          id: `stderr-${Date.now()}`,
-          role: 'system',
-          content: [{ type: 'text', text: `[stderr] ${text}` }],
-          timestamp: Date.now(),
-        }])
+        // 只显示真正的错误，过滤掉 warning
+        if (text.toLowerCase().includes('error') && !text.toLowerCase().includes('warning')) {
+          setMessages(prev => [...prev, {
+            id: `stderr-${Date.now()}`,
+            role: 'system',
+            content: [{ type: 'text', text: `[错误] ${text}` }],
+            timestamp: Date.now(),
+          }])
+        }
       },
 
       'claude:processExit': (...args: unknown[]) => {

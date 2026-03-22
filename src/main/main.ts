@@ -29,6 +29,7 @@ function createWindow() {
 
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
+    mainWindow.webContents.openDevTools({ mode: 'bottom' })
   } else {
     mainWindow.loadFile(join(__dirname, '../../dist/index.html'))
   }
@@ -36,10 +37,6 @@ function createWindow() {
   // Register IPC handlers that need mainWindow
   registerClaudeProcessHandlers(mainWindow)
 }
-
-// Register IPC handlers that don't need mainWindow
-registerConfigHandlers()
-registerDocPreviewHandlers()
 
 // IPC: Open folder dialog
 ipcMain.handle('dialog:openFolder', async () => {
@@ -50,7 +47,12 @@ ipcMain.handle('dialog:openFolder', async () => {
   return result.filePaths[0]
 })
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  // 在 app ready 之后注册，确保 app.getPath('userData') 可用
+  registerConfigHandlers()
+  registerDocPreviewHandlers()
+  createWindow()
+})
 
 app.on('window-all-closed', () => {
   app.quit()

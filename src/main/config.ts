@@ -1,75 +1,58 @@
-import { ipcMain } from 'electron'
+import { app, ipcMain } from 'electron'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
 
-const CLAUDE_DIR = join(homedir(), '.claude')
-const SETTINGS_PATH = join(CLAUDE_DIR, 'settings.json')
-const CLAUDE_JSON_PATH = join(CLAUDE_DIR, '.claude.json')
+// 本地隔离配置：存在 Electron userData 目录，不影响全局 ~/.claude/
+const CONFIG_DIR = join(app.getPath('userData'), 'config')
+const CONFIG_PATH = join(CONFIG_DIR, 'connection.json')
 
-interface AppConfig {
+export interface AppConfig {
   baseUrl: string
   modelName: string
   apiKey: string
 }
 
-async function ensureClaudeDir() {
-  if (!existsSync(CLAUDE_DIR)) {
-    await mkdir(CLAUDE_DIR, { recursive: true })
-  }
-}
+// 运行时缓存，供 claude-process.ts 读取
+let cachedConfig: AppConfig | null = null
 
-async function readJsonFile(path: string): Promise<Record<string, unknown>> {
-  try {
-    const content = await readFile(path, 'utf-8')
-    return JSON.parse(content)
-  } catch {
-    return {}
+async function ensureConfigDir() {
+  if (!existsSync(CONFIG_DIR)) {
+    await mkdir(CONFIG_DIR, { recursive: true })
   }
 }
 
 async function checkConfig(): Promise<boolean> {
   try {
-    const settings = await readJsonFile(SETTINGS_PATH)
-    const env = settings.env as Record<string, string> | undefined
-    return !!(env?.ANTHROPIC_BASE_URL)
+    const content = await readFile(CONFIG_PATH, 'utf-8')
+    const config = JSON.parse(content) as AppConfig
+    cachedConfig = config
+    return !!(config.baseUrl && config.apiKey)
   } catch {
     return false
   }
 }
 
 async function saveConfig(config: AppConfig): Promise<void> {
-  await ensureClaudeDir()
-
-  // Update settings.json
-  const settings = await readJsonFile(SETTINGS_PATH)
-  if (!settings.env) settings.env = {}
-  const env = settings.env as Record<string, string>
-  env.ANTHROPIC_BASE_URL = config.baseUrl
-  env.ANTHROPIC_MODEL = config.modelName
-  env.ANTHROPIC_API_KEY = config.apiKey
-  await writeFile(SETTINGS_PATH, JSON.stringify(settings, null, 2), 'utf-8')
-
-  // Update .claude.json
-  const claudeJson = await readJsonFile(CLAUDE_JSON_PATH)
-  claudeJson.model = config.modelName
-  await writeFile(CLAUDE_JSON_PATH, JSON.stringify(claudeJson, null, 2), 'utf-8')
+  await ensureConfigDir()
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8')
+  cachedConfig = config
 }
 
 async function loadConfig(): Promise<AppConfig | null> {
   try {
-    const settings = await readJsonFile(SETTINGS_PATH)
-    const env = settings.env as Record<string, string> | undefined
-    if (!env?.ANTHROPIC_BASE_URL) return null
-    return {
-      baseUrl: env.ANTHROPIC_BASE_URL || '',
-      modelName: env.ANTHROPIC_MODEL || '',
-      apiKey: env.ANTHROPIC_API_KEY || '',
-    }
+    const content = await readFile(CONFIG_PATH, 'utf-8')
+    const config = JSON.parse(content) as AppConfig
+    cachedConfig = config
+    return config
   } catch {
     return null
   }
+}
+
+/** 供 claude-process.ts 获取当前配置，注入到子进程环境变量 */
+export function getConfig(): AppConfig | null {
+  return cachedConfig
 }
 
 export function registerConfigHandlers() {

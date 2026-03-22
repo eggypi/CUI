@@ -1,15 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { ChatMessage, ChatContent, FileModification, PermissionRequest } from '@shared/types'
+import { ChatMessage, ChatContent, FileModification } from '@shared/types'
 
 interface UseClaudeProcessReturn {
   messages: ChatMessage[]
   fileModifications: FileModification[]
   isRunning: boolean
-  sessionId: string | null
-  startProcess: (workingFolder: string, permissionMode: string, sessionId?: string) => void
-  stopProcess: () => void
   sendMessage: (text: string) => void
-  respondPermission: (requestId: string, allowed: boolean) => void
   clearMessages: () => void
 }
 
@@ -17,7 +13,6 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [fileModifications, setFileModifications] = useState<FileModification[]>([])
   const [isRunning, setIsRunning] = useState(false)
-  const [sessionId, setSessionId] = useState<string | null>(null)
 
   // Track current assistant message being streamed
   const currentAssistantMsg = useRef<ChatMessage | null>(null)
@@ -44,9 +39,56 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
 
   useEffect(() => {
     const handlers: Record<string, (...args: unknown[]) => void> = {
-      'claude:init': (...args: unknown[]) => {
+      'claude:init': () => {
+        // session_id is now tracked by main process
+      },
+
+      // --print --verbose 模式：收到完整的 assistant 消息
+      'claude:assistantMessage': (...args: unknown[]) => {
         const event = args[0] as Record<string, unknown>
-        setSessionId(event.session_id as string)
+        const message = event.message as Record<string, unknown>
+        if (!message) return
+
+        const contentArr = message.content as Array<Record<string, unknown>>
+        if (!contentArr || !Array.isArray(contentArr)) return
+
+        const chatContent: ChatContent[] = []
+        for (const block of contentArr) {
+          if (block.type === 'text') {
+            chatContent.push({ type: 'text', text: block.text as string })
+          } else if (block.type === 'tool_use') {
+            chatContent.push({
+              type: 'tool_use',
+              id: block.id as string,
+              name: block.name as string,
+              input: (block.input as Record<string, unknown>) || {},
+            })
+            // Track file modifications
+            const toolName = (block.name as string || '').toLowerCase()
+            if (toolName === 'edit' || toolName === 'write') {
+              const input = (block.input as Record<string, unknown>) || {}
+              const filePath = (input.file_path as string) || ''
+              if (filePath) {
+                setFileModifications(prev => [...prev, {
+                  filePath,
+                  type: toolName === 'edit' ? 'edit' : 'write',
+                  newContent: (input.new_string as string) || (input.content as string) || '',
+                  oldContent: (input.old_string as string) || undefined,
+                  timestamp: Date.now(),
+                }])
+              }
+            }
+          }
+        }
+
+        if (chatContent.length > 0) {
+          setMessages(prev => [...prev, {
+            id: `assistant-${Date.now()}`,
+            role: 'assistant',
+            content: chatContent,
+            timestamp: Date.now(),
+          }])
+        }
       },
 
       'claude:messageStart': () => {
@@ -152,12 +194,39 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
 
       'claude:processStarted': () => {
         setIsRunning(true)
+        setMessages(prev => [...prev, {
+          id: `sys-started-${Date.now()}`,
+          role: 'system',
+          content: [{ type: 'text', text: 'Claude 进程已启动' }],
+          timestamp: Date.now(),
+        }])
       },
 
-      'claude:processExit': () => {
+      'claude:stderr': (...args: unknown[]) => {
+        const text = String(args[0] || '').trim()
+        if (!text) return
+        setMessages(prev => [...prev, {
+          id: `stderr-${Date.now()}`,
+          role: 'system',
+          content: [{ type: 'text', text: `[stderr] ${text}` }],
+          timestamp: Date.now(),
+        }])
+      },
+
+      'claude:processExit': (...args: unknown[]) => {
+        const event = args[0] as Record<string, unknown>
         setIsRunning(false)
         flushAssistantMessage()
         currentAssistantMsg.current = null
+        // code 0 = 正常完成，不显示消息；非 0 = 异常退出
+        if (event.code !== 0 && event.code !== null) {
+          setMessages(prev => [...prev, {
+            id: `sys-exit-${Date.now()}`,
+            role: 'system',
+            content: [{ type: 'text', text: `Claude 进程异常退出 (code: ${event.code})` }],
+            timestamp: Date.now(),
+          }])
+        }
       },
 
       'claude:processError': (...args: unknown[]) => {
@@ -184,18 +253,6 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
     }
   }, [flushAssistantMessage])
 
-  const startProcess = useCallback((workingFolder: string, permissionMode: string, resumeSessionId?: string) => {
-    window.electronAPI.invoke('claude:start', {
-      workingFolder,
-      permissionMode,
-      sessionId: resumeSessionId,
-    })
-  }, [])
-
-  const stopProcess = useCallback(() => {
-    window.electronAPI.invoke('claude:stop')
-  }, [])
-
   const sendMessage = useCallback((text: string) => {
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -205,10 +262,6 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
     }
     setMessages(prev => [...prev, userMsg])
     window.electronAPI.invoke('claude:sendMessage', text)
-  }, [])
-
-  const respondPermission = useCallback((requestId: string, allowed: boolean) => {
-    window.electronAPI.invoke('claude:permissionResponse', { requestId, allowed })
   }, [])
 
   const clearMessages = useCallback(() => {
@@ -222,11 +275,7 @@ export function useClaudeProcess(): UseClaudeProcessReturn {
     messages,
     fileModifications,
     isRunning,
-    sessionId,
-    startProcess,
-    stopProcess,
     sendMessage,
-    respondPermission,
     clearMessages,
   }
 }

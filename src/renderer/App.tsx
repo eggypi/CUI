@@ -19,8 +19,6 @@ function App() {
     messages,
     fileModifications,
     isRunning,
-    startProcess,
-    stopProcess,
     sendMessage,
     clearMessages,
   } = useClaudeProcess()
@@ -33,13 +31,11 @@ function App() {
       setConfigured(false)
     })
 
-    // Load recent folders
     const saved = localStorage.getItem('recentFolders')
     if (saved) {
       try { setRecentFolders(JSON.parse(saved)) } catch { /* ignore */ }
     }
 
-    // Load sessions
     window.electronAPI.invoke('claude:getSessions').then((result: unknown) => {
       const rawSessions = result as Array<Record<string, unknown>>
       if (rawSessions?.length) {
@@ -54,15 +50,20 @@ function App() {
     }).catch(() => {})
   }, [])
 
-  // Start/restart claude process when folder or mode changes
-  useEffect(() => {
-    if (workingFolder && configured) {
-      startProcess(workingFolder, permissionMode)
-    }
-    return () => {
-      stopProcess()
-    }
-  }, [workingFolder, permissionMode, configured, startProcess, stopProcess])
+  // 选文件夹时通知主进程
+  const handleFolderSelect = useCallback(async (folder: string) => {
+    setWorkingFolder(folder)
+    window.electronAPI.invoke('claude:setWorkingFolder', folder)
+    const updated = [folder, ...recentFolders.filter(f => f !== folder)].slice(0, 5)
+    setRecentFolders(updated)
+    localStorage.setItem('recentFolders', JSON.stringify(updated))
+  }, [recentFolders])
+
+  // 切换模式时通知主进程
+  const handlePermissionModeChange = useCallback((mode: 'plan' | 'acceptEdits') => {
+    setPermissionMode(mode)
+    window.electronAPI.invoke('claude:setPermissionMode', mode)
+  }, [])
 
   const handleConfigSave = (_config: AppConfig) => {
     setConfigured(true)
@@ -80,32 +81,18 @@ function App() {
     setSessions(prev => [newSession, ...prev])
     setActiveSessionId(newSession.id)
     clearMessages()
-    if (workingFolder) {
-      stopProcess()
-      startProcess(workingFolder, permissionMode)
-    }
-  }, [workingFolder, permissionMode, clearMessages, stopProcess, startProcess])
+    window.electronAPI.invoke('claude:resetSession')
+  }, [clearMessages])
 
   const handleSelectSession = useCallback((sessionId: string) => {
     setActiveSessionId(sessionId)
     clearMessages()
-    if (workingFolder) {
-      stopProcess()
-      startProcess(workingFolder, permissionMode, sessionId)
-    }
-  }, [workingFolder, permissionMode, clearMessages, stopProcess, startProcess])
-
-  const handleFolderSelect = useCallback(async (folder: string) => {
-    setWorkingFolder(folder)
-    const updated = [folder, ...recentFolders.filter(f => f !== folder)].slice(0, 5)
-    setRecentFolders(updated)
-    localStorage.setItem('recentFolders', JSON.stringify(updated))
-  }, [recentFolders])
+    // TODO: resume session via --resume
+  }, [clearMessages])
 
   const handleSendMessage = useCallback((text: string) => {
     sendMessage(text)
 
-    // Update session title from first message
     if (activeSessionId) {
       setSessions(prev => prev.map(s => {
         if (s.id === activeSessionId && s.title === '新会话') {
@@ -116,12 +103,6 @@ function App() {
     }
   }, [sendMessage, activeSessionId])
 
-  const handlePermissionModeChange = useCallback((mode: 'plan' | 'acceptEdits') => {
-    setPermissionMode(mode)
-    // Process will restart via useEffect
-  }, [])
-
-  // Show setup wizard if not configured or settings requested
   if (configured === null) {
     return (
       <div className="h-screen w-screen bg-dark-bg flex items-center justify-center">
@@ -136,7 +117,6 @@ function App() {
 
   return (
     <div className="h-screen w-screen bg-dark-bg text-dark-text flex overflow-hidden">
-      {/* Left Sidebar */}
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
@@ -144,8 +124,6 @@ function App() {
         onSelectSession={handleSelectSession}
         onOpenSettings={() => setShowSettings(true)}
       />
-
-      {/* Main Chat Panel */}
       <ChatPanel
         messages={messages}
         workingFolder={workingFolder}
@@ -157,8 +135,6 @@ function App() {
         onPermissionModeChange={handlePermissionModeChange}
         setIsProcessRunning={() => {}}
       />
-
-      {/* Right Panel */}
       <RightPanel
         fileModifications={fileModifications}
         workingFolder={workingFolder}

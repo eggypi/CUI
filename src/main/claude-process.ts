@@ -1,66 +1,107 @@
 import { spawn, ChildProcess } from 'child_process'
 import { ipcMain, BrowserWindow } from 'electron'
 import { EventEmitter } from 'events'
-
-interface ClaudeProcessOptions {
-  workingFolder: string
-  permissionMode: 'plan' | 'acceptEdits'
-  sessionId?: string
-}
+import { getConfig } from './config'
 
 class ClaudeProcessManager extends EventEmitter {
   private process: ChildProcess | null = null
   private mainWindow: BrowserWindow | null = null
-  private currentOptions: ClaudeProcessOptions | null = null
   private buffer: string = ''
+
+  // 持久状态
+  private workingFolder: string | null = null
+  private permissionMode: 'plan' | 'acceptEdits' = 'plan'
+  private sessionId: string | null = null
 
   setMainWindow(win: BrowserWindow) {
     this.mainWindow = win
   }
 
-  start(options: ClaudeProcessOptions) {
+  setWorkingFolder(folder: string) {
+    this.workingFolder = folder
+  }
+
+  setPermissionMode(mode: 'plan' | 'acceptEdits') {
+    this.permissionMode = mode
+  }
+
+  /**
+   * --print 模式：每条消息 = 一次 claude 进程调用
+   * 消息作为命令行参数传入，进程处理完自动退出
+   * 续对话通过 --resume <session-id>
+   */
+  sendMessage(text: string) {
+    if (!this.workingFolder) {
+      this.sendToRenderer('claude:processError', { message: '请先选择工作文件夹' })
+      return
+    }
+
+    // 如果上一次调用还在跑，先杀掉
     this.stop()
-    this.currentOptions = options
 
     const args = [
       '--print',
+      '--verbose',
       '--output-format', 'stream-json',
-      '--input-format', 'stream-json',
-      '--permission-mode', options.permissionMode,
+      '--permission-mode', this.permissionMode,
     ]
 
-    if (options.sessionId) {
-      args.push('--resume', options.sessionId)
+    if (this.sessionId) {
+      args.push('--resume', this.sessionId)
     }
+
+    // 用户消息作为最后一个参数
+    args.push(text)
+
+    const config = getConfig()
+    const childEnv = { ...process.env }
+    if (config) {
+      childEnv.ANTHROPIC_BASE_URL = config.baseUrl
+      childEnv.ANTHROPIC_API_KEY = config.apiKey
+      childEnv.ANTHROPIC_MODEL = config.modelName
+    }
+
+    console.log('[ClaudeProcess] Sending message:', text.slice(0, 80))
+    console.log('[ClaudeProcess] Args:', args.join(' '))
+    console.log('[ClaudeProcess] CWD:', this.workingFolder)
+    console.log('[ClaudeProcess] Session:', this.sessionId || '(new)')
 
     try {
       this.process = spawn('claude', args, {
-        cwd: options.workingFolder,
+        cwd: this.workingFolder,
         shell: true,
-        env: { ...process.env },
+        env: childEnv,
       })
 
       this.buffer = ''
+      this.sendToRenderer('claude:processStarted', { pid: this.process.pid })
+
+      // 消息通过命令行参数传入，立即关闭 stdin 避免 claude 等待
+      this.process.stdin?.end()
 
       this.process.stdout?.on('data', (data: Buffer) => {
-        this.handleStdout(data.toString())
+        const text = data.toString()
+        console.log('[ClaudeProcess] stdout chunk:', text.slice(0, 200))
+        this.handleStdout(text)
       })
 
       this.process.stderr?.on('data', (data: Buffer) => {
-        this.sendToRenderer('claude:stderr', data.toString())
+        const text = data.toString()
+        console.error('[ClaudeProcess] stderr:', text)
+        this.sendToRenderer('claude:stderr', text)
       })
 
       this.process.on('close', (code: number | null) => {
+        console.log('[ClaudeProcess] exited with code:', code)
         this.sendToRenderer('claude:processExit', { code })
         this.process = null
       })
 
       this.process.on('error', (err: Error) => {
+        console.error('[ClaudeProcess] spawn error:', err.message)
         this.sendToRenderer('claude:processError', { message: err.message })
         this.process = null
       })
-
-      this.sendToRenderer('claude:processStarted', { pid: this.process.pid })
     } catch (err) {
       this.sendToRenderer('claude:processError', {
         message: `Failed to start claude: ${err}`,
@@ -68,32 +109,7 @@ class ClaudeProcessManager extends EventEmitter {
     }
   }
 
-  stop() {
-    if (this.process) {
-      this.process.kill()
-      this.process = null
-    }
-  }
-
-  restart() {
-    if (this.currentOptions) {
-      this.start(this.currentOptions)
-    }
-  }
-
-  sendMessage(text: string) {
-    if (!this.process?.stdin) return
-
-    const message = JSON.stringify({
-      type: 'user_message',
-      message: {
-        role: 'user',
-        content: text,
-      },
-    })
-    this.process.stdin.write(message + '\n')
-  }
-
+  /** 发送权限审批响应（stdin 仍然打开，可以写入） */
   sendPermissionResponse(requestId: string, allowed: boolean) {
     if (!this.process?.stdin) return
 
@@ -105,6 +121,19 @@ class ClaudeProcessManager extends EventEmitter {
     this.process.stdin.write(response + '\n')
   }
 
+  stop() {
+    if (this.process) {
+      this.process.kill()
+      this.process = null
+    }
+  }
+
+  /** 重置会话（新建任务） */
+  resetSession() {
+    this.stop()
+    this.sessionId = null
+  }
+
   isRunning(): boolean {
     return this.process !== null
   }
@@ -112,7 +141,6 @@ class ClaudeProcessManager extends EventEmitter {
   private handleStdout(data: string) {
     this.buffer += data
     const lines = this.buffer.split('\n')
-    // Keep the last incomplete line in the buffer
     this.buffer = lines.pop() || ''
 
     for (const line of lines) {
@@ -123,7 +151,6 @@ class ClaudeProcessManager extends EventEmitter {
         const event = JSON.parse(trimmed)
         this.processEvent(event)
       } catch {
-        // Not JSON, forward as raw text
         this.sendToRenderer('claude:rawOutput', trimmed)
       }
     }
@@ -132,37 +159,45 @@ class ClaudeProcessManager extends EventEmitter {
   private processEvent(event: Record<string, unknown>) {
     const type = event.type as string
 
+    // 提取 session_id 用于后续 --resume
+    if (event.session_id && typeof event.session_id === 'string') {
+      this.sessionId = event.session_id
+    }
+
+    // --print --verbose 输出格式：每行一个完整 JSON
+    // type: "system" (subtype: "init") - 初始化
+    // type: "assistant" - 包含完整 message.content 数组
+    // type: "result" - 最终结果
     switch (type) {
-      case 'init':
+      case 'system':
         this.sendToRenderer('claude:init', event)
         break
 
-      case 'message_start':
-        this.sendToRenderer('claude:messageStart', event)
+      case 'assistant': {
+        // 完整的 assistant 消息，直接发给渲染进程
+        this.sendToRenderer('claude:assistantMessage', event)
         break
-
-      case 'content_block_start':
-        this.sendToRenderer('claude:contentBlockStart', event)
-        break
-
-      case 'content_block_delta':
-        this.sendToRenderer('claude:contentBlockDelta', event)
-        break
-
-      case 'content_block_stop':
-        this.sendToRenderer('claude:contentBlockStop', event)
-        break
-
-      case 'message_delta':
-        this.sendToRenderer('claude:messageDelta', event)
-        break
+      }
 
       case 'result':
         this.sendToRenderer('claude:result', event)
         break
 
+      // 也兼容增量 stream 事件（以防将来切换格式）
+      case 'message_start':
+        this.sendToRenderer('claude:messageStart', event)
+        break
+      case 'content_block_start':
+        this.sendToRenderer('claude:contentBlockStart', event)
+        break
+      case 'content_block_delta':
+        this.sendToRenderer('claude:contentBlockDelta', event)
+        break
+      case 'content_block_stop':
+        this.sendToRenderer('claude:contentBlockStop', event)
+        break
+
       default:
-        // Check for permission/control events
         if (type === 'control' || type === 'permission_request') {
           this.sendToRenderer('claude:permissionRequest', {
             id: event.id || `perm-${Date.now()}`,
@@ -190,8 +225,18 @@ const manager = new ClaudeProcessManager()
 export function registerClaudeProcessHandlers(mainWindow: BrowserWindow) {
   manager.setMainWindow(mainWindow)
 
-  ipcMain.handle('claude:start', (_event, options: ClaudeProcessOptions) => {
-    manager.start(options)
+  ipcMain.handle('claude:setWorkingFolder', (_event, folder: string) => {
+    manager.setWorkingFolder(folder)
+    return true
+  })
+
+  ipcMain.handle('claude:setPermissionMode', (_event, mode: 'plan' | 'acceptEdits') => {
+    manager.setPermissionMode(mode)
+    return true
+  })
+
+  ipcMain.handle('claude:sendMessage', (_event, text: string) => {
+    manager.sendMessage(text)
     return true
   })
 
@@ -200,13 +245,8 @@ export function registerClaudeProcessHandlers(mainWindow: BrowserWindow) {
     return true
   })
 
-  ipcMain.handle('claude:restart', () => {
-    manager.restart()
-    return true
-  })
-
-  ipcMain.handle('claude:sendMessage', (_event, text: string) => {
-    manager.sendMessage(text)
+  ipcMain.handle('claude:resetSession', () => {
+    manager.resetSession()
     return true
   })
 
@@ -220,7 +260,6 @@ export function registerClaudeProcessHandlers(mainWindow: BrowserWindow) {
   })
 
   ipcMain.handle('claude:getSkills', async () => {
-    // Try to get skills from claude CLI
     return new Promise((resolve) => {
       try {
         const proc = spawn('claude', ['skills', '--output-format', 'json'], {
